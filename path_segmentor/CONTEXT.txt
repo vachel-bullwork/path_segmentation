@@ -1,0 +1,109 @@
+═══════════════════════════════════════════════════════════════════════════════
+ path_segmentor — OpenCV CUDA Runtime Crash Fix
+ Date: 2026-06-24
+═══════════════════════════════════════════════════════════════════════════════
+
+SYMPTOM
+───────
+Node built and launched, then crashed immediately after "Camera: 960x600 ..."
+with:
+
+  terminate called after throwing an instance of 'cv::Exception'
+    what():  OpenCV(4.5.4) .../core/include/opencv2/core/private.cuda.hpp:106:
+    error: (-216:No CUDA support) The library is compiled without CUDA support
+    in function 'throw_no_cuda'
+
+  process has died ... exit code -6 (SIGABRT)
+
+The crash fired on the first cv::cuda::GpuMat allocation (ensureGpuBuffers).
+
+
+ROOT CAUSE — TWO COMPOUNDING BUGS
+─────────────────────────────────
+The machine has THREE OpenCV installs:
+  - /usr/lib/aarch64-linux-gnu  → 4.5.4d  (system, NO CUDA)
+  - /usr/lib                    → 4.8.0   (system, NO CUDA)
+  - /opt/opencv4.10             → 4.10.0  (custom build, WITH CUDA)  ← we need this
+
+cv::cuda::GpuMat exists as a symbol in the non-CUDA builds too, but its
+implementation just calls throw_no_cuda() → the SIGABRT above.
+
+Bug 1 — cmake never actually linked OpenCV 4.10.
+  - The original `set(OpenCV_DIR "/opt/opencv4.10/...")` was a plain set(),
+    which loses to the stale CMakeCache entry OpenCV_DIR=/usr/lib/cmake/opencv4.
+  - Even with `CACHE ... FORCE`, a second problem remained:
+    ament_target_dependencies(... cv_bridge ...) internally calls
+    find_package(OpenCV) with NO version pin. That OVERWRITES the cmake
+    imported target `opencv_core` so it points back at
+    /usr/lib/libopencv_core.so.4.8.0. So ${OpenCV_LIBS} expanded to the
+    WRONG files by link time. Confirmed via build/.../link.txt showing
+    /usr/lib/libopencv_core.so.4.8.0.
+
+Bug 2 — cv_bridge's 4.5d symbols won the link-order race.
+  - Original CMakeLists called ament_target_dependencies (pulls in cv_bridge →
+    libopencv_core.so.4.5d) BEFORE target_link_libraries with OpenCV.
+  - ELF symbol resolution is first-wins. The non-CUDA 4.5 stub for
+    cv::cuda::GpuMat populated the symbol table before the 4.10 CUDA version,
+    so every GpuMat call hit throw_no_cuda().
+
+
+THE FIX
+───────
+File: src/path_segmentor/CMakeLists.txt
+  1. Stopped using cmake OpenCV imported targets entirely. Instead hardcoded
+     FULL library paths:
+        /opt/opencv4.10/lib/libopencv_core.so.4.10.0
+        /opt/opencv4.10/lib/libopencv_imgproc.so.4.10.0
+     Full .so paths cannot be overwritten by ament_target_dependencies calling
+     find_package(OpenCV). The linker reads the SONAME (libopencv_core.so.410)
+     straight from the file and writes it into DT_NEEDED.
+  2. Call target_link_libraries(... ${OPENCV410_LIBS}) BEFORE
+     ament_target_dependencies, so libopencv_core.so.410 lands in DT_NEEDED
+     ahead of libcv_bridge.so and its transitive libopencv_core.so.4.5d.
+  3. Added an EXISTS check that FATAL_ERRORs early if the 4.10 libs are missing.
+  4. Kept RPATH = /opt/opencv4.10/lib so .so.410 resolves to the CUDA build
+     at runtime.
+
+File: src/path_segmentor/launch/corridor_viz.launch.py
+  - Added belt-and-suspenders:
+        additional_env={'LD_PRELOAD':
+            '/opt/opencv4.10/lib/libopencv_core.so.4.10.0'}
+    Guarantees the CUDA-enabled core lib populates the symbol table first even
+    if DT_NEEDED order ever regresses.
+
+Files NOT changed:
+  - src/path_corridor_segmenter.cpp  (still full CUDA — GpuMat + kernels)
+  - src/terrain_kernels.cu / include/.../terrain_kernels.cuh  (unchanged)
+
+
+VERIFICATION
+────────────
+  readelf -d <binary> | grep NEEDED
+    → libopencv_core.so.410   appears BEFORE   libcv_bridge.so   ✓
+
+  ld build warning now reads:
+    "libopencv_core.so.4.5d ... may conflict with libopencv_core.so.410"
+    (confirms 4.10 is the one being linked)  ✓
+
+  Launch test reaches:
+    [INFO] GPU buffers allocated: 960x600
+    (this line only runs if cv::cuda::GpuMat succeeds with real CUDA —
+     previously the exact crash point)  ✓
+
+
+REBUILD STEPS
+─────────────
+  # cmake cache holds the bad OpenCV_DIR — must delete it, not just rebuild
+  rm -rf build/path_segmentor
+  colcon build --packages-select path_segmentor
+  source install/setup.bash
+  ros2 launch path_segmentor corridor_viz.launch.py
+
+
+NOTE / FOLLOW-UP
+────────────────
+The cleanest long-term fix is to build cv_bridge from source against
+OpenCV 4.10 in this workspace, which removes the 4.5d transitive dependency
+and the whole symbol-conflict class. The current fix (hard paths + link order
++ LD_PRELOAD) works around the system cv_bridge without rebuilding it.
+═══════════════════════════════════════════════════════════════════════════════
