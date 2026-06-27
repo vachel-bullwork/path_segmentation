@@ -1,6 +1,10 @@
 # PROJECT CONTEXT — Bullwork Mobility 3-Layer Vision Pipeline
-# Last updated: 2026-06-27
-# Workspace: ~/new/   (this file + src/ + nav2 files all live here)
+# Last updated: 2026-06-27 (session 2)
+# Workspaces:
+#   ~/new/                                      ← path_segmentor src on Jetson
+#   /workspaces/fsm_ws/                         ← FSM + sim stack (Docker container, dev)
+#   /workspaces/simulation_acu_classic/         ← Gazebo sim assets
+
 
 ## ═══════════════════════════════════════════════════════════════════════════════
 ## HARDWARE & ENVIRONMENT
@@ -15,10 +19,6 @@
 - OpenCV:      4.10 CUDA — custom build at /opt/opencv4.10/
 - CUDA arch:   SM 8.7 (Ampere, Orin Nano)
 - Nav2:        Active, Regulated Pure Pursuit controller
-- Workspaces:
-    ~/new/                                      ← path_segmentor + nav2/bt files
-    /workspaces/simulation_acu_classic/         ← Gazebo sim (Docker container)
-    /workspaces/fsm_ws/ or ~/sim_build/fsm_ws/  ← FSM stack (state_machine_acu)
 
 
 ## ═══════════════════════════════════════════════════════════════════════════════
@@ -38,6 +38,9 @@ NOT publishing on this robot (ZED wrapper config):
 Camera optical frame: zed_left_camera_frame_optical
 Camera resolution:    960 × 600
 Camera intrinsics:    fx=366.8  fy=366.8  cx=489.7  cy=297.0
+
+Sim camera (stereo_camera_optical_frame):
+  Resolution: 640 × 480   fx=fy=554.4   cx=320.5   cy=240.5
 
 Depth fps fix (TODO):
   depth_mode=ULTRA → ~2 Hz. Change to PERFORMANCE or NEURAL_LITE → 15-30 Hz.
@@ -73,7 +76,8 @@ Verified: node logs "GPU buffers allocated: 960x600" → real CUDA GpuMat workin
 ## path_segmentor — COMPLETE CURRENT STATE
 ## ═══════════════════════════════════════════════════════════════════════════════
 
-Location: ~/new/src/path_segmentor/
+Location (sim/dev): /workspaces/fsm_ws/src/path_segmentation/path_segmentor/
+Location (Jetson):  ~/new/src/path_segmentor/
 Status:   BUILDS on Jetson (CUDA) and sim host (CPU-only, auto-detected)
           Camera + terrain pipeline VERIFIED WORKING on live robot
 
@@ -85,10 +89,10 @@ Package files:
     terrain_kernels.cuh           — CUDA kernel declarations
     terrain_backend.hpp           — TerrainBackend abstract interface + TerrainParams
   src/
-    terrain_kernels.cu            — 4 CUDA kernels
-    terrain_backend_cpu.cpp       — CPU backend (pixel-exact) + factory
-    terrain_backend_cuda.cpp      — CUDA backend (compiled only when nvcc present)
-    path_corridor_segmenter.cpp   — Main ROS 2 node
+    terrain_kernels.cu            — 4 CUDA kernels (UNCHANGED)
+    terrain_backend_cpu.cpp       — CPU backend (pixel-exact) + factory (UNCHANGED)
+    terrain_backend_cuda.cpp      — CUDA backend (compiled only when nvcc present) (UNCHANGED)
+    path_corridor_segmenter.cpp   — Main ROS 2 node (see BUGS FIXED below)
   launch/
     corridor_viz.launch.py        — parameterised launch + LD_PRELOAD + ZED remappings
 
@@ -101,9 +105,12 @@ colcon build --packages-select path_segmentor --cmake-args -DCMAKE_BUILD_TYPE=Re
 source ~/new/install/setup.bash
 ros2 launch path_segmentor corridor_viz.launch.py
 
-# Sim host / dev machine (CPU-only)
-cd ~/new && colcon build --packages-select path_segmentor
-PATH_SEGMENTOR_USE_CUDA=0 ros2 launch path_segmentor corridor_viz.launch.py
+# Sim host / dev machine (CPU-only, sim time)
+cd /workspaces/fsm_ws
+source .env_vars
+colcon build --packages-select path_segmentor --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
+ros2 launch path_segmentor corridor_viz.launch.py use_sim_time:=true ground_angle_deg:=40
 ```
 
 
@@ -112,7 +119,8 @@ PATH_SEGMENTOR_USE_CUDA=0 ros2 launch path_segmentor corridor_viz.launch.py
 ### depthCb  (~2 Hz currently)
 1. Decode depth (32FC1 metres or 16UC1 mm)
 2. Save raw depth → latest_depth_cpu_ (for pointcloud unprojection)
-3. Look up expected ground normal via TF base_link→camera; fallback (0,-1,0)
+3. Look up expected ground normal via TF base_link→camera using rclcpp::Time(0)
+   (latest transform — avoids sim-time/wall-clock mismatch); fallback (0,-1,0)
 4. backend→computeTerrain():
      Kernel 1: Bilateral depth filter (5×5, smooths gravel, preserves walls)
      Kernel 2: Surface normal estimation (5×5 cross ±2px, camera optical frame)
@@ -123,26 +131,39 @@ PATH_SEGMENTOR_USE_CUDA=0 ros2 launch path_segmentor corridor_viz.launch.py
 ### boundaryCb  (10 Hz timer — CAMERA INDEPENDENT)
 - Reads latest_path_ directly (no camera, no terrain data needed)
 - Builds world XY corridor polygon for ALL path poses using max_half_ (nominal 1m)
-- TF lookup: base_link in path frame
+- TF lookup: base_link in path frame using rclcpp::Time(0) (latest, sim-safe)
 - cv::pointPolygonTest → publishes /corridor/safety_violation
+- publishBoundaryCloud() [MOVED HERE from imageCb — see BUGS FIXED]:
+    Trims to boundary_lookahead_m_ arc-length from path start (default 15 m)
+    Stamps with this->get_clock()->now() (always fresh — path->header.stamp is stale)
+    Uses fixed max_half_ width (not shrunk) → clean parallel fence lines
+    Published in path frame (map) at 10 Hz, camera-independent
 - Fires regardless of which direction the camera faces
-  (old version was inside imageCb and ONLY fired when path was visible in camera)
 
 ### imageCb  (~6 Hz)
 1. Get latest Nav2 /plan
-2. TF lookup: camera ← map
+2. TF lookup: camera ← map  (uses msg->header.stamp — sim time from image header)
 3. For each path pose: compute left_hw, right_hw (starts ±1m, shrinks if WALL)
-4. Build left_world[], right_world[] (world XY of corridor edges)
-5. Build left_pts[], right_pts[] (image-space corridor boundary, visible poses only)
-6. Near-field extension: find bottommost (highest v) pts in left/right,
+4. Build left_pts[], right_pts[] (image-space corridor boundary, visible poses only)
+   NOTE: left_world/right_world removed — boundary cloud now lives in boundaryCb
+5. Near-field extension: find bottommost (highest v) pts in left/right,
    extend to image bottom row → covers ground immediately in front of camera
-7. Build corridor_mask (filled polygon, CV_8UC1)
-8. publishTerrainDebug() — green/red classification, BLACK outside corridor
-9. publishObstacleCloud() — WALL pixels → 3D in camera frame → /corridor/obstacle_cloud
-10. publishBoundaryCloud() — corridor edge points densified+stacked → /corridor/boundary_cloud
-11. backend→composite() — overlay (green/red inside, BLACK outside)
-12. Draw centreline (yellow) + boundary lines (cyan)
-13. Publish /corridor/overlay
+6. Build corridor_mask (filled polygon, CV_8UC1)
+7. publishTerrainDebug() — green/red classification, BLACK outside corridor
+   (BLACK inside corridor = LABEL_INVALID: depth returned NaN for that pixel)
+8. publishObstacleCloud() — WALL pixels → 3D in camera frame → /corridor/obstacle_cloud
+9. backend→composite() — overlay (green/red inside, BLACK outside)
+10. Draw centreline (yellow) + boundary lines (cyan)
+11. Publish /corridor/overlay
+
+
+## LABEL MEANINGS IN VISUAL OUTPUT
+  LABEL_GROUND (green)  — normal within ground_angle_thresh_deg of expected ground
+  LABEL_WALL   (red)    — steep surface / obstacle edges
+  LABEL_INVALID (black) — depth was NaN/0/out-of-range → cannot compute normal
+    On real ZED X: rare (active stereo handles dark surfaces via texture/IR pattern)
+    In Gazebo: common for dark/black materials (sim returns NaN for non-reflective)
+    Only WALL pixels feed the obstacle_cloud — INVALID pixels do NOT mark costmap
 
 
 ## SUBSCRIBED TOPICS
@@ -158,13 +179,13 @@ PATH_SEGMENTOR_USE_CUDA=0 ros2 launch path_segmentor corridor_viz.launch.py
   /corridor/terrain_debug    Image BGR8       — pure classification (no RGB blend), BLACK outside
   /corridor/safety_violation Bool             — True when vehicle outside corridor (10 Hz, camera-independent)
   /corridor/obstacle_cloud   PointCloud2      — WALL pixels → 3D camera frame → Nav2 costmap obstacle marking
-  /corridor/boundary_cloud   PointCloud2      — corridor edge fence in MAP frame → planner cannot exit ±1m zone
+  /corridor/boundary_cloud   PointCloud2      — corridor fence in MAP frame, 10 Hz, fixed max_half_ width
 
 
 ## ALL PARAMETERS
   max_corridor_half_m        1.0     ±1 m each side (2 m total)
   robot_half_width_m         0.3     corridor never shrinks below this
-  ground_angle_thresh_deg    30.0    steeper than this = WALL; try 35-40 on rough terrain
+  ground_angle_thresh_deg    30.0    steeper than this = WALL; use 35-40 in Gazebo sim
   bilateral_sigma_s          2.0     spatial sigma bilateral filter (pixels)
   bilateral_sigma_d          0.10    depth sigma (m); try 0.15 on coarse gravel
   max_depth_jump_m           0.5     depth discontinuity → normal marked invalid
@@ -176,6 +197,8 @@ PATH_SEGMENTOR_USE_CUDA=0 ros2 launch path_segmentor corridor_viz.launch.py
   base_frame                 base_link
   publish_terrain_debug      true
   cloud_stride               2       obstacle cloud pixel stride (2=every other=4× smaller cloud)
+  boundary_lookahead_m       15.0    arc-length (m) of path to publish as fence [NEW]
+                                     prevents full global plan flooding the costmap
 
 
 ## ARCHITECTURE NOTES
@@ -185,50 +208,107 @@ PATH_SEGMENTOR_USE_CUDA=0 ros2 launch path_segmentor corridor_viz.launch.py
 - ALL visual output masked to corridor: black outside
 - GPU buffers pre-allocated, reused every frame (no per-frame alloc)
 - GpuMat.upload() WITHOUT stream arg (cv::cuda::Stream ≠ cudaStream_t)
-- Boundary cloud in MAP frame (no TF needed by costmap)
-- Obstacle cloud in CAMERA frame (costmap does TF internally)
-- boundaryCb uses max_half_ not shrunk width — safety zone = full declared corridor
+- Boundary cloud in MAP frame (no TF needed by costmap), published from boundaryCb at 10 Hz
+- Obstacle cloud in CAMERA frame (costmap does TF internally), published from imageCb at ~6 Hz
+- boundaryCb uses max_half_ (not shrunk width) for BOTH safety check AND boundary fence
+- All TF lookups use rclcpp::Time(0) (latest) — safe in both real robot and simulation
 
 
 ## ═══════════════════════════════════════════════════════════════════════════════
-## Nav2 FILES — in ~/new/
+## BUGS FIXED — session 2 (2026-06-27)
 ## ═══════════════════════════════════════════════════════════════════════════════
 
-### ~/new/nav2_corridor_pursuit.yaml
-Copy of nav2_bare_pure_pursuit.yaml with these changes:
-  - bt_navigator: default_nav_through_poses_bt_xml → construction_bt_tp_corridor.xml
-  - local_costmap: added obstacle_layer with TWO sources:
-      corridor_cloud  marking:true  clearing:true   — real obstacles from depth pipeline
-      boundary_cloud  marking:true  clearing:false  — virtual corridor fence (never erased)
-  - local_costmap update_frequency: 2→5 Hz
-  - local_costmap inflation_radius: 0.0→0.1 m
-  - collision_monitor, controller, planner, global costmap: UNCHANGED
+### Bug 1 — TF extrapolation in boundaryCb
+  Symptom: "[WARN] BoundaryCrossing TF [base_link→map]: Lookup would require
+            extrapolation into the future. Requested 1782540549 but latest is 402"
+  Root cause: boundaryCb is a wall-timer. It called get_clock()->now() which
+              returns wall-clock time (~1.78B s in 2026). TF data in simulation
+              is stamped at sim time (~402 s). The buffer sees the request as
+              "far in the future" relative to its stored data.
+  Fix: All TF lookups in the node now use rclcpp::Time(0) = "give me the latest
+       available transform". Works identically on real robot and in simulation.
+  Files changed: path_corridor_segmenter.cpp
+    - checkBoundaryCrossing(): removed stamp param, uses rclcpp::Time(0)
+    - computeExpectedGroundNormal(): removed stamp param, uses rclcpp::Time(0)
 
-### ~/new/construction_bt_tp_corridor.xml
-Replaces construction_bt_tp.xml (original: plan once → follow forever, CM stops on obstacle)
+### Bug 2 — boundary_cloud: stale timestamp + variable width → scattered dots
+  Symptom: /corridor/boundary_cloud appeared as scattered red dots across the
+            entire map in RViz instead of two clean parallel lines along the path.
+  Root cause (A) — stale timestamp:
+    publishBoundaryCloud() used path->header.stamp (when Nav2 first published
+    the plan, e.g. t=424s). By t=1142s that stamp was 718 s old. Nav2 and RViz
+    look up TF at that timestamp → wrong/stale transform → wrong world positions.
+  Root cause (B) — variable fence width:
+    publishBoundaryCloud was called from imageCb using left_hw/right_hw (the
+    SHRUNK widths — change every frame based on current camera view). With
+    clearing:false in the costmap, every frame's different fence positions
+    accumulated indefinitely → fence appeared scattered across map.
+  Root cause (C) — full global path published as fence:
+    All N path poses (potentially hundreds of meters) were densified and
+    published each frame → thousands of points, overwhelming the costmap.
+  Fix: Moved publishBoundaryCloud from imageCb → boundaryCb:
+    - Uses fixed max_half_ (correct per design intent, no accumulation scatter)
+    - Stamps with this->get_clock()->now() (always current)
+    - Trimmed to boundary_lookahead_m_ (15 m default) via trimToLookahead()
+    - Fires at 10 Hz regardless of camera state
+    - Removed left_world/right_world vectors from imageCb (dead code)
+  Files changed: path_corridor_segmenter.cpp, corridor_viz.launch.py
 
-New behaviour:
-  1. Clear costmaps + compute initial global plan (once, via SingleTrigger)
-  2. PipelineSequence (concurrent):
-       RateController @ 1 Hz:
-         IsPathValid?
-           YES → keep following (no action)
-           NO  → ReplanAround sequence:
-                   RemovePassedGoals → ComputePathThroughPoses
-                   replan OK  → FollowPath picks up new path → vehicle goes around
-                   replan FAIL → Fallback fails → PipelineSequence fails →
-                                 collision monitor already stopped vehicle →
-                                 FSM receives nav failure → handles recovery
-       FollowPath  (runs concurrently with RateController)
+### Bug 3 — sim_nav2.launch.py loading default (non-corridor) nav2 config
+  Symptom: path_segmentor published /corridor/boundary_cloud and
+            /corridor/obstacle_cloud correctly but Nav2 costmap ignored them —
+            the obstacle_layer wasn't wired up to those topics.
+  Root cause: sim_nav2.launch.py used get_config_filepaths() which resolved to
+              vamana_nav2_params.yaml (no obstacle_layer sources) and
+              default_nav_through_poses.xml (standard BT, no reactive replanning).
+  Fix: sim_nav2.launch.py now derives config_dir from the resolved EKF path and
+       directly loads the corridor-specific files:
+         nav2_params:         nav2_corridor_pursuit.yaml
+           (obstacle_layer with corridor_cloud + boundary_cloud sources)
+         bt_nav_through_poses: construction_bt_tp_corridor.xml
+           (reactive-replan BT: check path validity 1 Hz → go around or stop)
+         ekf_params:          vamana_navsat_ekf.yaml         (unchanged)
+         bt_nav_to_pose:      default_nav_to_pose.xml        (unchanged)
+  Files changed: state_machine/launch/sim_nav2.launch.py
 
-How the corridor is enforced:
+
+## ═══════════════════════════════════════════════════════════════════════════════
+## Nav2 CONFIG FILES
+## ═══════════════════════════════════════════════════════════════════════════════
+
+Location (sim): /workspaces/fsm_ws/src/vamana_pro_nav2_config/simulation_configs/
+                sim_construction_classic_nav2/
+
+Files:
+  nav2_corridor_pursuit.yaml       ← ACTIVE in sim (loaded by sim_nav2.launch.py)
+    - bt_navigator: default_nav_through_poses_bt_xml → construction_bt_tp_corridor.xml
+    - local_costmap: obstacle_layer with TWO sources:
+        corridor_cloud  topic:/corridor/obstacle_cloud  marking:true  clearing:true
+        boundary_cloud  topic:/corridor/boundary_cloud  marking:true  clearing:false
+    - local_costmap update_frequency: 5 Hz
+    - local_costmap inflation_radius: 0.1 m
+
+  construction_bt_tp_corridor.xml  ← ACTIVE in sim (reactive-replan BT)
+    Behaviour:
+    1. Clear costmaps + compute initial global plan (once, SingleTrigger)
+    2. PipelineSequence (concurrent):
+         RateController @ 1 Hz → IsPathValid?
+           YES → keep following
+           NO  → RemovePassedGoals → ComputePathThroughPoses
+                 replan OK   → FollowPath picks up new path → vehicle goes around
+                 replan FAIL → BT FAILURE → collision monitor stops vehicle
+                               → FSM receives nav failure → handles recovery
+         FollowPath (concurrent with above)
+
+  vamana_nav2_params.yaml          ← standard params (no corridor obstacle layer)
+  default_nav_through_poses.xml    ← standard BT (plan once, follow forever)
+  default_nav_to_pose.xml          ← nav-to-pose BT (unchanged, used by both)
+  vamana_navsat_ekf.yaml           ← EKF params (unchanged)
+
+How the corridor is enforced end-to-end:
   boundary_cloud marks corridor edges LETHAL → planner cannot route outside ±1 m
   corridor_cloud marks real obstacles LETHAL → planner routes around them
   When obstacle fills entire corridor → ComputePathThroughPoses fails → vehicle stops
-
-TO ACTIVATE:
-  Copy construction_bt_tp_corridor.xml to where bt_navigator loads BT files,
-  OR use a full absolute path in default_nav_through_poses_bt_xml in the yaml.
 
 
 ## ═══════════════════════════════════════════════════════════════════════════════
@@ -242,33 +322,41 @@ DONE ✅
 
   Corridor
   - Path corridor projection ±1m from Nav2 /plan
-  - Continuous shrink when WALL detected at boundary
+  - Continuous shrink when WALL detected at boundary (visual only — fence stays at max_half_)
   - Near-field fix: corridor polygon extended to image bottom so close-up ground is covered
   - All visual output masked (black outside corridor)
-  - /corridor/safety_violation — 10 Hz timer, CAMERA-INDEPENDENT (fixed: was camera-gated)
+  - /corridor/safety_violation — 10 Hz timer, CAMERA-INDEPENDENT
 
-  Nav2 integration
+  Nav2 integration (fully wired end-to-end in simulation)
   - /corridor/obstacle_cloud — WALL pixels in camera frame → costmap obstacle marking
-  - /corridor/boundary_cloud — corridor fence in map frame → planner cannot exit ±1 m
+  - /corridor/boundary_cloud — corridor fence at 10 Hz, fixed max_half_, fresh timestamp
   - nav2_corridor_pursuit.yaml — costmap with both observation sources
   - construction_bt_tp_corridor.xml — reactive replan BT: go around or stop
+  - sim_nav2.launch.py — loads corridor yaml + corridor BT (was loading defaults before)
+
+  Bug fixes (session 2)
+  - TF extrapolation in sim: all lookups use rclcpp::Time(0)
+  - boundary_cloud scattered dots: moved to boundaryCb, fixed width, fresh stamp
+  - boundary_cloud full-path flood: trimToLookahead() limits fence to 15 m ahead
+  - sim_nav2.launch.py: corridor config now loaded by default (was standard config)
 
   Infrastructure
   - OpenCV 4.5/4.10 runtime conflict resolved
   - ZED topic remappings in launch file
+  - use_sim_time launch arg in corridor_viz.launch.py
 
   Simulation
   - sim_acu_interface.py: all FSM mock signals; core_acu_cpp dependency removed
   - sim_fsm_commander.py: full CLI for all FSM commands
   - sim_fsm_webgui.py: browser GUI at localhost:5050
-  - sim_nav2.launch.py: EKF + Nav2 + location_head_gps + correct use_sim_time
+  - sim_nav2.launch.py: EKF + Nav2 + location_head_gps + FSM nodes + corridor config
   - URDF camera optical frame fix (now in TF tree)
   - Default world: bullwork_rowcrop (238 bush obstacles)
   - publish_orchestrator_status defaults true → SELF_CHECK instant
 
 STILL TODO ❌
   Field (Day 1):
-  - Tune ground_angle_thresh_deg and bilateral_sigma_d on real gravel
+  - Tune ground_angle_thresh_deg (start at 30, may need 35) and bilateral_sigma_d on real gravel
   - Fix ZED depth fps: depth_mode → PERFORMANCE in ZED launch
 
   Layer 1 extensions (Day 2):
@@ -295,15 +383,16 @@ The vehicle drives a Nav2 GPS mission on gravel/offroad terrain.
 The system must:
   1. Know the driveable corridor (±1 m around path)                       ← DONE
   2. Detect obstacles inside corridor                                      ← DONE
-  3. Alert if vehicle drifts outside corridor                              ← DONE (fixed)
+  3. Alert if vehicle drifts outside corridor                              ← DONE
   4. Feed obstacles to Nav2 costmap for avoidance                         ← DONE
   5. Prevent planner routing outside corridor                              ← DONE (fence)
   6. Replan around obstacle; stop if impossible                            ← DONE (new BT)
   7. Distinguish bush (passable) from pipe/person (stop)                  ← TODO (Kernel 5 + YOLO)
   8. Pass through vegetation, stop for real obstacles                      ← TODO (Layer 2)
 
-Current: items 1-6 complete. Vehicle navigates GPS waypoints, detects and marks
-obstacles, replans around them inside the corridor, stops if fully blocked.
+Current: items 1-6 complete and verified in simulation. Full corridor pipeline
+wired end-to-end: depth → terrain classification → obstacle/boundary clouds →
+Nav2 costmap → reactive BT replanning → FSM failure handling.
 
 
 ## ═══════════════════════════════════════════════════════════════════════════════
@@ -312,35 +401,39 @@ obstacles, replans around them inside the corridor, stops if fully blocked.
 
 Build (once, inside container):
 ```bash
-cd /workspaces/simulation_acu_classic
-colcon build --packages-select vamana_simulation && source install/setup.bash
+cd /workspaces/fsm_ws && source .env_vars
+colcon build --packages-select path_segmentor state_machine vamana_pro_nav2_config
+source install/setup.bash
 ```
 
-3 terminals:
+4 terminals:
 ```bash
 # T1 — Gazebo + robot + mock vehicle signals + camera relays
 ros2 launch vamana_simulation bullwork_configurable.launch.py
 
-# T2 — EKF (odom+map TF) + Nav2 + location_head_gps
+# T2 — EKF + Nav2 (corridor config) + location_head_gps + FSM nodes
 ros2 launch state_machine sim_nav2.launch.py
+# (now loads nav2_corridor_pursuit.yaml + construction_bt_tp_corridor.xml by default)
 
-# T3 — FSM only  (NOT fsm.launch.py — that duplicates EKF+Nav2)
-ros2 run state_machine fsm_node
+# T3 — path_segmentor (corridor vision pipeline)
+ros2 launch path_segmentor corridor_viz.launch.py use_sim_time:=true ground_angle_deg:=40
 
-# T4 optional — web GUI (open http://localhost:5050 in browser)
-ros2 run vamana_simulation sim_fsm_webgui
+# T4 optional — web GUI
+ros2 run vamana_simulation sim_fsm_webgui    # http://localhost:5050
 ```
+
+NOTE: sim_nav2.launch.py now includes fsm_node, communication, recovery_manager.
+      Do NOT also run fsm_node separately — that duplicates it.
+      Do NOT run fsm.launch.py — that duplicates EKF + Nav2.
 
 FSM flow in sim:
   BOOTING → SELF_CHECK (instant) → IDLE
   Web GUI → Configure App → READY
-  Web GUI → Send Task   → TASK_RUNNING
+  Web GUI → Send Task   → TASK_RUNNING (Nav2 active, corridor enforced)
 
 GPS chain (verified, no changes needed):
   /gps/fix → navsat_transform → /odometry/gps → EKF map → /odometry/global
   → location_head_gps (/toLL service) → /gps/estimated_fix + /position/heading
-
-Do NOT run fsm.launch.py — it re-launches EKF + Nav2 which duplicates sim_nav2.launch.py.
 
 
 ## ═══════════════════════════════════════════════════════════════════════════════
@@ -361,21 +454,29 @@ Do NOT run fsm.launch.py — it re-launches EKF + Nav2 which duplicates sim_nav2
    ament_target_dependencies calls find_package(OpenCV) which overwrites the
    cmake target to system 4.5. Full .so paths bypass cmake entirely.
 
-5. Simple pinhole projection (not PinholeCameraModel)
+5. Simple pinhole unprojection (not PinholeCameraModel)
    ZED publishes RECTIFIED images → no distortion. Avoids image_geometry which
-   pulls in OpenCV 4.5.
+   pulls in OpenCV 4.5. Formula: X=(u-cx)*d/fx, Y=(v-cy)*d/fy, Z=d
 
 6. boundaryCb at 10 Hz, independent of camera
-   Safety check must fire when vehicle exits corridor regardless of camera
-   direction. Old imageCb approach was gated by path visibility → bug fixed.
+   Safety check AND boundary fence must fire regardless of camera direction.
+   Old imageCb approach was camera-gated → safety gap + stale fence timestamps.
 
 7. boundary_cloud in MAP frame, obstacle_cloud in CAMERA frame
    Fence must stay at correct world position regardless of camera pointing.
-   Obstacle cloud is in sensor frame — Nav2 convention, costmap does TF.
+   Obstacle cloud in sensor frame — Nav2 convention, costmap does TF internally.
 
 8. Near-field polygon extension
    Nav2 path starts ahead of vehicle. Extending polygon to image bottom ensures
    ground immediately in front of camera is inside the corridor mask.
+
+9. rclcpp::Time(0) for all TF lookups
+   Avoids wall-clock vs sim-time mismatch. "Latest available" is correct for
+   both static transforms (camera mount) and slow-changing poses (vehicle).
+
+10. boundary_cloud width = fixed max_half_, NOT shrunk left_hw
+    Shrink is for visual display only. The Nav2 fence must be a stable fixed width.
+    Variable-width fence + clearing:false = costmap accumulates all widths → scatter.
 
 
 ## ═══════════════════════════════════════════════════════════════════════════════
@@ -383,33 +484,41 @@ Do NOT run fsm.launch.py — it re-launches EKF + Nav2 which duplicates sim_nav2
 ## ═══════════════════════════════════════════════════════════════════════════════
 
 ```bash
-# Build
-cd ~/new && colcon build --packages-select path_segmentor
-source ~/new/install/setup.bash
+# Build (sim/dev)
+cd /workspaces/fsm_ws && source .env_vars
+colcon build --packages-select path_segmentor --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 
-# Run
+# Run corridor node (sim)
+ros2 launch path_segmentor corridor_viz.launch.py use_sim_time:=true
+ros2 launch path_segmentor corridor_viz.launch.py use_sim_time:=true ground_angle_deg:=40 bilateral_sigma_d:=0.12
+
+# Run corridor node (real Jetson)
 ros2 launch path_segmentor corridor_viz.launch.py
-ros2 launch path_segmentor corridor_viz.launch.py ground_angle_deg:=35 bilateral_sigma_d:=0.12
 
-# Verify
-ros2 topic hz /corridor/safety_violation    # 10 Hz (camera-independent now)
+# Verify topics flowing
+ros2 topic hz /corridor/safety_violation    # 10 Hz
 ros2 topic hz /corridor/terrain_debug       # ~2 Hz (depth rate)
 ros2 topic hz /corridor/overlay             # ~6 Hz (image rate)
 ros2 topic hz /corridor/obstacle_cloud      # ~6 Hz
-ros2 topic hz /corridor/boundary_cloud      # ~6 Hz
+ros2 topic hz /corridor/boundary_cloud      # 10 Hz (moved to boundaryCb)
 ros2 topic echo /corridor/safety_violation  # false while inside corridor
 
-# View
+# Verify boundary_cloud timestamp is fresh (should match current time)
+ros2 topic echo /corridor/boundary_cloud --once | grep stamp
+
+# View images
 ros2 run rqt_image_view rqt_image_view      # /corridor/overlay or /corridor/terrain_debug
+
+# TF chain verification
+ros2 run tf2_tools view_frames
+ros2 run tf2_ros tf2_echo map base_link
+ros2 run tf2_ros tf2_echo map stereo_camera_optical_frame  # sim
+ros2 run tf2_ros tf2_echo map zed_left_camera_frame_optical  # real robot
 
 # ZED check
 ros2 topic hz /zed/zed_node/rgb/color/rect/image     # ~15 Hz
 ros2 topic hz /zed/zed_node/depth/depth_registered   # ~2 Hz (fix: depth_mode)
-
-# TF chain
-ros2 run tf2_tools view_frames
-ros2 run tf2_ros tf2_echo base_link zed_left_camera_frame_optical
-ros2 run tf2_ros tf2_echo map base_link
 
 # Jetson power
 sudo nvpmodel -m 0 && sudo jetson_clocks
@@ -417,7 +526,7 @@ sudo nvpmodel -m 0 && sudo jetson_clocks
 # Simulation
 ros2 launch vamana_simulation bullwork_configurable.launch.py
 ros2 launch state_machine sim_nav2.launch.py
-ros2 run state_machine fsm_node
+ros2 launch path_segmentor corridor_viz.launch.py use_sim_time:=true ground_angle_deg:=40
 ros2 run vamana_simulation sim_fsm_webgui    # http://localhost:5050
 
 # FSM commands (CLI alternative to web GUI)

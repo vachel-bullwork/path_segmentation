@@ -40,6 +40,16 @@ def generate_launch_description():
             description='Ignore depth beyond this range. ZED X is accurate to ~15m stereo, '
                         'but for corridor viz 8-12m is usually enough.'),
 
+        DeclareLaunchArgument('boundary_lookahead_m', default_value='15.0',
+            description='Arc-length (m) of path to publish as corridor fence. '
+                        'Limits boundary_cloud to nearby poses; the full global plan would '
+                        'flood the costmap with thousands of useless far-away fence points.'),
+
+        DeclareLaunchArgument('use_sim_time', default_value='false',
+            description='Set true when running in Gazebo simulation. '
+                        'Aligns the node clock with sim time so TF lookups in boundaryCb '
+                        'use the same time base as TF publishers.'),
+
         # ── Node ─────────────────────────────────────────────────────────
         Node(
             package='path_segmentor',
@@ -48,6 +58,7 @@ def generate_launch_description():
             output='screen',
             additional_env=node_env,
             parameters=[{
+                'use_sim_time':           LaunchConfiguration('use_sim_time'),
                 'max_corridor_half_m':    LaunchConfiguration('max_corridor_half_m'),
                 'robot_half_width_m':     LaunchConfiguration('robot_half_width_m'),
                 'ground_angle_thresh_deg': LaunchConfiguration('ground_angle_deg'),
@@ -61,6 +72,7 @@ def generate_launch_description():
                 'shrink_samples':         6,
                 'base_frame':             'base_link',
                 'publish_terrain_debug':  True,
+                'boundary_lookahead_m':   LaunchConfiguration('boundary_lookahead_m'),
             }],
             remappings=[
                 ('/zed/zed_node/left/image_rect_color', '/zed/zed_node/rgb/color/rect/image'),

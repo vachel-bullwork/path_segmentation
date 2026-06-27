@@ -59,6 +59,7 @@ public:
     this->declare_parameter("base_frame",  std::string("base_link"));
     this->declare_parameter("publish_terrain_debug",  true);
     this->declare_parameter("cloud_stride", 2);
+    this->declare_parameter("boundary_lookahead_m", 15.0);
 
     max_half_         = this->get_parameter("max_corridor_half_m").as_double();
     robot_half_       = this->get_parameter("robot_half_width_m").as_double();
@@ -72,7 +73,8 @@ public:
     shrink_samples_   = this->get_parameter("shrink_samples").as_int();
     base_frame_       = this->get_parameter("base_frame").as_string();
     publish_debug_    = this->get_parameter("publish_terrain_debug").as_bool();
-    cloud_stride_     = std::max(1, (int)this->get_parameter("cloud_stride").as_int());
+    cloud_stride_          = std::max(1, (int)this->get_parameter("cloud_stride").as_int());
+    boundary_lookahead_m_  = this->get_parameter("boundary_lookahead_m").as_double();
 
     double angle_deg  = this->get_parameter("ground_angle_thresh_deg").as_double();
     cos_ground_thresh_= std::cos(angle_deg * M_PI / 180.0);
@@ -197,8 +199,24 @@ private:
     }
 
     checkBoundaryCrossing(left_world, right_world,
-                          path->header.frame_id,
-                          this->get_clock()->now());
+                          path->header.frame_id);
+
+    // ── Corridor boundary fence for Nav2 planner ──────────────────────────
+    // Published HERE instead of imageCb so that:
+    //   1. Width = fixed max_half_ — imageCb uses shrunk left_hw which changes
+    //      every frame; with clearing:false the costmap accumulates all widths → scatter.
+    //   2. Timestamp = now() — path->header.stamp is stale after the initial plan
+    //      is published (e.g. 718 s old). Nav2 / RViz look up TF at that stamp.
+    //   3. Camera-independent — fence fires at 10 Hz regardless of camera state.
+    if (boundary_pub_->get_subscription_count() > 0) {
+      size_t fence_n = trimToLookahead(left_world, boundary_lookahead_m_);
+      std::vector<cv::Point2f> lw(left_world.begin(), left_world.begin() + fence_n);
+      std::vector<cv::Point2f> rw(right_world.begin(), right_world.begin() + fence_n);
+      std_msgs::msg::Header fence_hdr;
+      fence_hdr.stamp    = this->get_clock()->now();
+      fence_hdr.frame_id = path->header.frame_id;  // map
+      publishBoundaryCloud(fence_hdr, lw, rw);
+    }
   }
 
   void infoCb(const sensor_msgs::msg::CameraInfo::SharedPtr msg) {
@@ -244,7 +262,7 @@ private:
 
     // Compute expected ground normal in camera frame from vehicle orientation
     float gnd_nx, gnd_ny, gnd_nz;
-    if (!computeExpectedGroundNormal(msg->header.stamp, gnd_nx, gnd_ny, gnd_nz)) {
+    if (!computeExpectedGroundNormal(gnd_nx, gnd_ny, gnd_nz)) {
       // Fallback: assume camera is upright → ground normal ≈ (0, -1, 0)
       // in optical frame (+Y = down, so ground pointing "up" = -Y)
       gnd_nx = 0.0f; gnd_ny = -1.0f; gnd_nz = 0.0f;
@@ -302,13 +320,10 @@ private:
     auto & poses = path->poses;
     int N = (int)poses.size();
 
-    std::vector<cv::Point>   left_pts, right_pts, centre_pts;
-    std::vector<cv::Point2f> left_world, right_world;   // for boundary crossing check
+    std::vector<cv::Point> left_pts, right_pts, centre_pts;
     left_pts.reserve(N);
     right_pts.reserve(N);
     centre_pts.reserve(N);
-    left_world.reserve(N);
-    right_world.reserve(N);
 
     for (int i = 0; i < N; i++) {
       // Direction vector from this pose to next (or previous for last)
@@ -351,15 +366,6 @@ private:
           }
         }
       }
-
-      // ── Collect world-space boundary for crossing check ──────────────
-      // cos/sin(yaw+π/2) = -sin(yaw)/+cos(yaw) → perpendicular left
-      left_world.emplace_back(
-          (float)(poses[i].pose.position.x - left_hw  * std::sin(yaw)),
-          (float)(poses[i].pose.position.y + left_hw  * std::cos(yaw)));
-      right_world.emplace_back(
-          (float)(poses[i].pose.position.x + right_hw * std::sin(yaw)),
-          (float)(poses[i].pose.position.y - right_hw * std::cos(yaw)));
 
       // ── Project final boundary points ────────────────────────────────
       auto left_px  = projectOffsetPoint(poses[i], yaw, left_hw,  +1.0, tf_cam_map);
@@ -416,13 +422,6 @@ private:
       publishObstacleCloud(msg->header, corridor_mask);
     }
 
-    // ── Corridor boundary fence for Nav2 planner ──────────────────────────
-    // Publishes virtual walls along the left+right corridor edges so the
-    // global/local planner cannot route outside the ±1 m safety zone.
-    if (boundary_pub_->get_subscription_count() > 0) {
-      publishBoundaryCloud(path->header, left_world, right_world);
-    }
-
     // ── Overlay compositing (CUDA or CPU backend) ────────────────────────
     cv::Mat result;
     backend_->composite(rgb_cpu, corridor_mask, cpu_labels_,
@@ -451,6 +450,21 @@ private:
   // ═══════════════════════════════════════════════════════════════════════════
   //  HELPERS
   // ═══════════════════════════════════════════════════════════════════════════
+
+  // Return the index (exclusive end) that limits world-frame boundary points
+  // to at most `max_m` metres of arc-length from the first pose.
+  // Used to prevent publishing the full global plan as a fence.
+  static size_t trimToLookahead(const std::vector<cv::Point2f> & pts, double max_m) {
+    if (pts.size() <= 1) return pts.size();
+    double accum = 0.0;
+    for (size_t i = 1; i < pts.size(); ++i) {
+      float dx = pts[i].x - pts[i-1].x;
+      float dy = pts[i].y - pts[i-1].y;
+      accum += std::sqrt(dx*dx + dy*dy);
+      if (accum >= max_m) return i + 1;
+    }
+    return pts.size();
+  }
 
   // Project a point that is `dist` metres laterally from a path pose.
   // sign: +1 = left of heading, -1 = right (0 = on centreline).
@@ -502,13 +516,11 @@ private:
   // On a slope, base_link z-axis tilts with the vehicle, so this automatically
   // adapts the "what is ground" reference to the current terrain pitch/roll.
   bool computeExpectedGroundNormal(
-      const rclcpp::Time & stamp,
       float & gnx, float & gny, float & gnz)
   {
     try {
       auto tf = tf_buffer_.lookupTransform(
-          cam_frame_, base_frame_, stamp,
-          rclcpp::Duration::from_seconds(0.05));
+          cam_frame_, base_frame_, rclcpp::Time(0));
 
       // Extract rotation (quaternion → rotate unit Z vector)
       double qx = tf.transform.rotation.x;
@@ -539,16 +551,19 @@ private:
   void checkBoundaryCrossing(
       const std::vector<cv::Point2f> & left_world,
       const std::vector<cv::Point2f> & right_world,
-      const std::string & world_frame,
-      const rclcpp::Time & stamp)
+      const std::string & world_frame)
   {
     std_msgs::msg::Bool out;
     out.data = false;
 
     try {
+      // Use Time(0) = latest available transform.
+      // boundaryCb fires from a wall-timer; using get_clock()->now() breaks in
+      // simulation because wall-clock time >> sim time, causing "extrapolation
+      // into the future". Time(0) always returns the most recent transform
+      // regardless of clock source.
       auto tf = tf_buffer_.lookupTransform(
-          world_frame, base_frame_, stamp,
-          rclcpp::Duration::from_seconds(0.05));
+          world_frame, base_frame_, rclcpp::Time(0));
 
       cv::Point2f base_xy(
           (float)tf.transform.translation.x,
@@ -761,6 +776,8 @@ private:
   rclcpp::Time  terrain_stamp_;
   bool          terrain_ready_{false};
   int           cloud_stride_{2};    // downsample stride for obstacle pointcloud
+
+  double boundary_lookahead_m_{15.0};
 
   // Terrain processing backend (CUDA or CPU, chosen at construction)
   std::unique_ptr<pcv::TerrainBackend> backend_;
