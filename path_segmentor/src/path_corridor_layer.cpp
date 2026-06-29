@@ -107,7 +107,53 @@ void PathCorridorLayer::updateCosts(
   if (!plan || plan->poses.size() < 2) return;
 
   const double hw2 = hw * hw;
-  const auto & poses = plan->poses;
+  const auto & raw_poses = plan->poses;
+
+  // Build effective point list. When SKIP_GLOBAL_PLANNER=true the FSM publishes
+  // a path whose first waypoint is meters ahead of the robot — so the robot
+  // starts OUTSIDE the corridor and is immediately in LETHAL territory.
+  // Fix: if the robot is farther than hw from the nearest plan segment, prepend
+  // its current position so the corridor extends back to cover the robot.
+  // When SKIP=false NavFn's path already starts at the robot, so min_dist_sq ≤ hw²
+  // and no prepend happens — this branch is a no-op in that case.
+  std::vector<std::pair<double, double>> pts;
+  pts.reserve(raw_poses.size() + 1);
+
+  double rx = 0.0, ry = 0.0;
+  bool got_robot = false;
+  try {
+    auto tf_msg = tf_->lookupTransform(
+      "map", base_frame_, rclcpp::Time(0),
+      rclcpp::Duration::from_seconds(0.05));
+    rx = tf_msg.transform.translation.x;
+    ry = tf_msg.transform.translation.y;
+    got_robot = true;
+  } catch (const tf2::TransformException &) {}
+
+  if (got_robot) {
+    double min_d2 = std::numeric_limits<double>::max();
+    for (size_t k = 1; k < raw_poses.size(); ++k) {
+      const double ax = raw_poses[k-1].pose.position.x;
+      const double ay = raw_poses[k-1].pose.position.y;
+      const double bx = raw_poses[k].pose.position.x;
+      const double by = raw_poses[k].pose.position.y;
+      const double dx = bx - ax, dy = by - ay;
+      const double lsq = dx*dx + dy*dy;
+      double t = 0.0;
+      if (lsq > 1e-9) {
+        t = std::clamp(((rx-ax)*dx + (ry-ay)*dy) / lsq, 0.0, 1.0);
+      }
+      const double ex = ax + t*dx - rx, ey = ay + t*dy - ry;
+      min_d2 = std::min(min_d2, ex*ex + ey*ey);
+    }
+    if (min_d2 > hw2) {
+      pts.emplace_back(rx, ry);  // robot is outside corridor — extend it back
+    }
+  }
+
+  for (const auto & ps : raw_poses) {
+    pts.emplace_back(ps.pose.position.x, ps.pose.position.y);
+  }
 
   for (int j = min_j; j < max_j; ++j) {
     for (int i = min_i; i < max_i; ++i) {
@@ -115,11 +161,9 @@ void PathCorridorLayer::updateCosts(
       master_grid.mapToWorld(i, j, wx, wy);
 
       bool inside = false;
-      for (size_t k = 1; k < poses.size() && !inside; ++k) {
-        const double ax = poses[k-1].pose.position.x;
-        const double ay = poses[k-1].pose.position.y;
-        const double bx = poses[k].pose.position.x;
-        const double by = poses[k].pose.position.y;
+      for (size_t k = 1; k < pts.size() && !inside; ++k) {
+        const double ax = pts[k-1].first,  ay = pts[k-1].second;
+        const double bx = pts[k].first,    by = pts[k].second;
         const double dx = bx - ax, dy = by - ay;
         const double lsq = dx*dx + dy*dy;
         double t = 0.0;
@@ -136,6 +180,13 @@ void PathCorridorLayer::updateCosts(
       }
     }
   }
+}
+
+// ── reset — called by ClearEntireCostmap BT node ─────────────────────────────
+void PathCorridorLayer::reset()
+{
+  std::lock_guard<std::mutex> lk(plan_mutex_);
+  current_plan_.reset();
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
