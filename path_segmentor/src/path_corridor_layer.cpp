@@ -177,6 +177,8 @@ void PathCorridorLayer::updateCosts(
 
       if (!inside) {
         master_grid.setCost(i, j, nav2_costmap_2d::LETHAL_OBSTACLE);
+      } else {
+        master_grid.setCost(i, j, nav2_costmap_2d::FREE_SPACE);
       }
     }
   }
